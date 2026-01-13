@@ -1,249 +1,216 @@
-Cloudflare DDNS Updater (Rootless Podman) – Reproducible Setup
-0) What this does
+# Cloudflare DDNS Updater (Rootless Podman)
 
-Updates these DNS records in your Cloudflare zone to your current public IP:
+A tiny container that keeps Cloudflare DNS records pointed at your **current public IP**.
 
-hello.az-lab.dev
+It’s designed for a **rootless Podman** host (like your `svc-docker-01` lab VM), and it updates multiple records (ex: `hello`, root `@`, and `*`) on a loop.
 
-az-lab.dev (root / @)
+Repo: `aeger/Cloudflare-DDNS-Updater` citeturn2view0
 
-*.az-lab.dev
+---
 
-Runs in a rootless Podman container on a schedule (loop + sleep).
+## What it updates
 
-1) Prereqs (same as Traefik host)
+Given a zone (example: `az-lab.dev`) and a list of record names, it will ensure **A records** exist and match your current public IPv4:
+
+- `hello.az-lab.dev`
+- `az-lab.dev` (zone apex / `@`)
+- `*.az-lab.dev` citeturn2view0
+
+> Note: this repo updates **A records**. If you want IPv6 too, you’ll need AAAA support (easy add later).
+
+---
+
+## Requirements
+
+On Ubuntu (24.04+ recommended):
+
+```bash
 sudo apt update
-sudo apt install -y podman uidmap slirp4netns fuse-overlayfs
-loginctl enable-linger $USER
+sudo apt install -y podman uidmap slirp4netns fuse-overlayfs jq curl bash
+loginctl enable-linger "$USER"
+```
 
-2) Directory layout
-mkdir -p ~/cf-ddns
-cd ~/cf-ddns
+That last line is the “make rootless stuff start after reboots” switch humans forget and then blame computers for. citeturn2view0
 
+---
 
-Suggested repo layout later:
+## Cloudflare API token
 
-cf-ddns/
-├── Containerfile (or Dockerfile)
-├── cf-ddns.sh
-├── cf-ddns.env.example
-└── README.md
+Create a Cloudflare API token scoped to **only what you need**:
 
-3) Cloudflare API token (DDNS)
+**Permissions (minimum):**
+- Zone → DNS → Edit
+- Zone → Zone → Read (recommended; helps zone lookup)
 
-Create a token in Cloudflare with:
+Scope it to your zone (example: `az-lab.dev`). citeturn2view0
 
-Zone → DNS → Edit
+---
 
-Zone → Zone → Read (recommended, helps zone lookup)
+## Install
 
-Scope to zone: az-lab.dev
+### 1) Clone
 
-4) Env file (do NOT commit the real one)
+```bash
+git clone https://github.com/aeger/Cloudflare-DDNS-Updater.git
+cd Cloudflare-DDNS-Updater
+```
 
-Create: ~/cf-ddns/cf-ddns.env
+### 2) Create your env file
 
+Copy the example:
+
+```bash
+cp cf-ddns.env.example cf-ddns.env
+chmod 600 cf-ddns.env
+```
+
+Edit `cf-ddns.env` and set:
+
+- `CF_API_TOKEN` (your token)
+- `CF_ZONE_NAME` (example: `az-lab.dev`)
+- `CF_RECORD_NAMES` (comma-separated list)
+- Optional knobs: `PROXIED`, `TTL`, `INTERVAL_SECONDS`
+
+Example:
+
+```env
 CF_API_TOKEN=REDACTED
 CF_ZONE_NAME=az-lab.dev
 CF_RECORD_NAMES=hello.az-lab.dev,az-lab.dev,*.az-lab.dev
 PROXIED=true
 TTL=120
 INTERVAL_SECONDS=300
+```
 
+---
 
-Lock permissions:
+## Build & run (rootless Podman)
 
-chmod 600 ~/cf-ddns/cf-ddns.env
+### Build
 
-5) Containerfile / Dockerfile
+This repo uses a `Containerfile` (Podman-friendly).
 
-Use one name consistently. Podman likes Containerfile or Dockerfile. You already got bitten by DockerFile. Humans and capitalization, man.
+```bash
+podman build -t localhost/cf-ddns:latest -f Containerfile .
+```
 
-Create ~/cf-ddns/Containerfile:
+### Run
 
-FROM alpine:3.20
-
-RUN apk add --no-cache curl jq bash ca-certificates
-
-COPY cf-ddns.sh /usr/local/bin/cf-ddns.sh
-RUN chmod +x /usr/local/bin/cf-ddns.sh
-
-ENTRYPOINT ["/usr/local/bin/cf-ddns.sh"]
-
-6) The updater script
-
-Create ~/cf-ddns/cf-ddns.sh:
-
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Required env vars
-: "${CF_API_TOKEN:?Missing CF_API_TOKEN}"
-: "${CF_ZONE_NAME:?Missing CF_ZONE_NAME}"
-: "${CF_RECORD_NAMES:?Missing CF_RECORD_NAMES}"
-
-# Optional
-PROXIED="${PROXIED:-true}"
-TTL="${TTL:-120}"
-INTERVAL_SECONDS="${INTERVAL_SECONDS:-300}"
-
-api="https://api.cloudflare.com/client/v4"
-
-cf() {
-  curl -fsS \
-    -H "Authorization: Bearer ${CF_API_TOKEN}" \
-    -H "Content-Type: application/json" \
-    "$@"
-}
-
-get_public_ip() {
-  # simple + reliable
-  curl -fsS https://api.ipify.org
-}
-
-get_zone_id() {
-  cf "${api}/zones?name=${CF_ZONE_NAME}&status=active" | jq -r '.result[0].id'
-}
-
-ensure_record() {
-  local zone_id="$1"
-  local name="$2"
-  local ip="$3"
-
-  # Lookup existing record (A only)
-  local rec
-  rec="$(cf "${api}/zones/${zone_id}/dns_records?type=A&name=${name}" | jq -r '.result[0].id // empty')"
-
-  if [[ -z "${rec}" ]]; then
-    echo "Creating A record: ${name} -> ${ip}"
-    cf -X POST "${api}/zones/${zone_id}/dns_records" \
-      --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":${TTL},\"proxied\":${PROXIED}}" \
-      >/dev/null
-  else
-    # Update only if changed
-    local cur
-    cur="$(cf "${api}/zones/${zone_id}/dns_records/${rec}" | jq -r '.result.content')"
-    if [[ "${cur}" != "${ip}" ]]; then
-      echo "Updating A record: ${name} ${cur} -> ${ip}"
-      cf -X PUT "${api}/zones/${zone_id}/dns_records/${rec}" \
-        --data "{\"type\":\"A\",\"name\":\"${name}\",\"content\":\"${ip}\",\"ttl\":${TTL},\"proxied\":${PROXIED}}" \
-        >/dev/null
-    else
-      echo "No change: ${name} -> ${ip}"
-    fi
-  fi
-}
-
-main() {
-  local zone_id
-  zone_id="$(get_zone_id)"
-  if [[ -z "${zone_id}" || "${zone_id}" == "null" ]]; then
-    echo "ERROR: Could not find zone id for ${CF_ZONE_NAME}"
-    exit 1
-  fi
-
-  echo "Cloudflare DDNS starting for zone ${CF_ZONE_NAME} (${zone_id})"
-  echo "Records: ${CF_RECORD_NAMES}"
-  echo "Interval: ${INTERVAL_SECONDS}s  TTL: ${TTL}  Proxied: ${PROXIED}"
-
-  while true; do
-    ip="$(get_public_ip)"
-    echo "Public IP: ${ip}"
-
-    IFS=',' read -ra names <<< "${CF_RECORD_NAMES}"
-    for n in "${names[@]}"; do
-      n="$(echo "$n" | xargs)"  # trim
-      [[ -z "${n}" ]] && continue
-      ensure_record "${zone_id}" "${n}" "${ip}"
-    done
-
-    sleep "${INTERVAL_SECONDS}"
-  done
-}
-
-main "$@"
-
-
-Make executable:
-
-chmod +x ~/cf-ddns/cf-ddns.sh
-
-7) Build and run (rootless)
-
-Build:
-
-cd ~/cf-ddns
-podman build -t cf-ddns:latest -f Containerfile .
-
-
-Run:
-
+```bash
 podman rm -f cf-ddns 2>/dev/null || true
+
 podman run -d \
   --name cf-ddns \
   --restart=unless-stopped \
-  --env-file "$HOME/cf-ddns/cf-ddns.env" \
-  cf-ddns:latest
+  --env-file "$PWD/cf-ddns.env" \
+  localhost/cf-ddns:latest
+```
 
+### Watch logs
 
-Check logs:
-
+```bash
 podman logs -f cf-ddns
+```
 
-8) Auto-start on reboot (headless)
+You should see it discover your zone ID, your public IP, and then create/update records. citeturn2view0
 
-You already did the correct model:
+---
 
---restart=unless-stopped
+## Verify in Cloudflare
 
-loginctl enable-linger $USER
+Quick sanity check using the Cloudflare API (optional):
 
-Verify by rebooting:
+```bash
+# list DNS records for the zone (example, tweak if you want filtering)
+curl -sS -H "Authorization: Bearer $CF_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/zones?name=$CF_ZONE_NAME&status=active" | jq
+```
 
+Or just check in the Cloudflare dashboard: you should see A records for each name pointing at your WAN IP. citeturn2view0
+
+---
+
+## Autostart on boot (rootless)
+
+If you already ran:
+
+```bash
+loginctl enable-linger "$USER"
+```
+
+…and you used `--restart=unless-stopped`, Podman will bring the container back after reboot. citeturn2view0
+
+To verify:
+
+```bash
 sudo reboot
 # after reboot
 podman ps
 podman logs cf-ddns | tail -n 50
+```
 
+### Want “real” systemd management? (optional)
 
-If it doesn’t come up, 99% of the time lingering wasn’t enabled for the user that owns the container.
+If you prefer systemd user services, you can generate one:
 
-9) Optional: make it more “infra-grade”
-A) Separate image tag
-podman build -t localhost/cf-ddns:$(date +%F) -f Containerfile .
+```bash
+podman generate systemd --new --name cf-ddns --files --user
+mkdir -p ~/.config/systemd/user
+mv container-cf-ddns.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now container-cf-ddns.service
+```
 
-B) Pin the public IP endpoint
+(Still keep lingering enabled if the box is headless.)
 
-If you hate depending on one service, add a fallback:
+---
 
-ipify, ifconfig.me, Cloudflare trace, etc.
+## Security notes
 
-C) Don’t proxy wildcard
+- **Do not commit** `cf-ddns.env` (contains your token).
+- Keep the token scoped to a single zone.
+- If you enable Cloudflare proxying (`PROXIED=true`) on a wildcard, you’re proxying *everything* under `*.yourdomain`. That might be exactly what you want, or it might be a surprise later. citeturn2view0
 
-Cloudflare can proxy wildcard records, but you might not want everything under *.az-lab.dev proxied. You can split records and set proxied per record if needed.
+---
 
-GitHub repo?
+## Troubleshooting
 
-Same answer as Traefik: yes, and preferably private.
+### “Zone could not be found”
+- Token missing Zone:Read, or zone name mismatch.
+- Make sure `CF_ZONE_NAME` is exactly the zone in Cloudflare. citeturn2view0
 
-Include:
+### Container runs but doesn’t restart after reboot
+- Most common cause: lingering not enabled for the user that owns the container. citeturn2view0
 
-Containerfile
+### Nothing changes even though your ISP IP changed
+- Check `INTERVAL_SECONDS`
+- Make sure your “public IP” endpoint is reachable
+- Confirm your WAN IP via a separate check:
 
-cf-ddns.sh
+```bash
+curl -sS https://api.ipify.org && echo
+```
 
-cf-ddns.env.example
+(The script in this repo uses ipify by default.) citeturn2view0
 
-README.md
+---
 
-Exclude:
+## Repo hygiene checklist
 
-real cf-ddns.env (token)
+Already good:
+- `Containerfile`
+- `cf-ddns.sh`
+- `cf-ddns.env.example`
+- `.gitignore` present citeturn2view0
 
-anything with your real secrets
+Suggested tweaks:
+- Add a short `CHANGELOG.md` (even if it’s just dates + bullets).
+- Add a `LICENSE` file (unless you want “all rights reserved by default” energy).
+- Consider a GitHub Action for shellcheck (optional but nice).
 
-Add a .gitignore:
+---
 
-cf-ddns.env
-*.env
-secrets/
+## Why this exists
+
+Because home internet connections are fickle, and humans prefer blaming routers instead of accepting the concept of “dynamic.”
+
