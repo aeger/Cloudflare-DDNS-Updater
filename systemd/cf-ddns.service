@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudflare DDNS Updater (rootless Podman)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/podman run --rm --name cf-ddns \
+  --env-file %h/cf-ddns/cf-ddns.env \
+  localhost/cf-ddns:latest
+
+ExecStop=/usr/bin/podman stop -t 10 cf-ddns
+ExecStopPost=/usr/bin/podman rm -f cf-ddns
+
+Restart=always
+RestartSec=10
+Environment=PODMAN_SYSTEMD_UNIT=cf-ddns.service
+
+[Install]
+WantedBy=default.target
